@@ -1,20 +1,25 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <chrono>
-#include <iomanip>
-#include <thread>
+
+#include <mpi.h>
+
 #include <algorithm>
-#include <string>
+#include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <vector>
 
 using namespace std;
 
-using Matrix = vector<vector<int>>;
-using ResultMatrix = vector<vector<long long>>;
+using Matrix = vector<long long>;
 
-ResultMatrix multiply(const Matrix &A, const Matrix &B, int n)
+void multiply_sequential(
+    const Matrix &A,
+    const Matrix &B,
+    Matrix &C,
+    int n)
 {
-    ResultMatrix C(n, vector<long long>(n, 0));
+    fill(C.begin(), C.end(), 0);
 
     for (int i = 0; i < n; i++)
     {
@@ -22,194 +27,255 @@ ResultMatrix multiply(const Matrix &A, const Matrix &B, int n)
         {
             for (int j = 0; j < n; j++)
             {
-                C[i][j] +=
-                    static_cast<long long>(A[i][k]) * B[k][j];
+                C[static_cast<size_t>(i) * n + j] +=
+                    A[static_cast<size_t>(i) * n + k] *
+                    B[static_cast<size_t>(k) * n + j];
             }
         }
     }
-
-    return C;
-}
-
-ResultMatrix multiply_parallel(
-    const Matrix &A,
-    const Matrix &B,
-    int n,
-    int thread_count)
-{
-    ResultMatrix C(n, vector<long long>(n, 0));
-    vector<thread> threads;
-
-    int rows_per_thread = n / thread_count;
-    int remaining_rows = n % thread_count;
-    int start_row = 0;
-
-    for (int t = 0; t < thread_count; t++)
-    {
-        int rows = rows_per_thread + (t < remaining_rows ? 1 : 0);
-        int end_row = start_row + rows;
-
-        threads.emplace_back(
-            [&A, &B, &C, n, start_row, end_row]()
-            {
-                for (int i = start_row; i < end_row; i++)
-                {
-                    for (int k = 0; k < n; k++)
-                    {
-                        for (int j = 0; j < n; j++)
-                        {
-                            C[i][j] +=
-                                static_cast<long long>(A[i][k]) * B[k][j];
-                        }
-                    }
-                }
-            });
-
-        start_row = end_row;
-    }
-
-    for (auto &thread : threads)
-    {
-        thread.join();
-    }
-
-    return C;
 }
 
 int main(int argc, char *argv[])
 {
-    int thread_count = 4;
+    MPI_Init(&argc, &argv);
 
-    if (argc > 2)
-    {
-        cerr << "Usage: ./build/matrix [thread_count]\n";
-        return 1;
-    }
+    int rank = 0;
+    int process_count = 0;
 
-    if (argc == 2)
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &process_count);
+
+    int n = 0;
+    int valid = 1;
+
+    Matrix A;
+    Matrix B;
+    Matrix C;
+
+    double sequential_time = 0.0;
+
+    if (rank == 0)
     {
-        try
+        ifstream inA("A.txt");
+        ifstream inB("B.txt");
+
+        if (!inA || !inB)
         {
-            size_t pos = 0;
-            thread_count = stoi(argv[1], &pos);
+            cerr << "Cannot open input files\n";
+            valid = 0;
+        }
+        else
+        {
+            int nA = 0;
+            int nB = 0;
 
-            if (pos != string(argv[1]).length())
+            if (!(inA >> nA) || !(inB >> nB) ||
+                nA <= 0 || nA != nB)
             {
-                cerr << "Invalid thread count\n";
-                return 1;
+                cerr << "Invalid matrix sizes\n";
+                valid = 0;
+            }
+            else if (
+                static_cast<long long>(nA) * nA >
+                numeric_limits<int>::max())
+            {
+                cerr << "Matrix is too large for MPI counts\n";
+                valid = 0;
+            }
+            else
+            {
+                n = nA;
+
+                size_t matrix_size =
+                    static_cast<size_t>(n) * n;
+
+                A.resize(matrix_size);
+                B.resize(matrix_size);
+                C.resize(matrix_size);
+
+                for (size_t i = 0; i < matrix_size; i++)
+                {
+                    if (!(inA >> A[i]) || !(inB >> B[i]))
+                    {
+                        cerr << "Cannot read matrix elements\n";
+                        valid = 0;
+                        break;
+                    }
+                }
             }
         }
-        catch (const exception &)
+
+        if (valid)
         {
-            cerr << "Invalid thread count\n";
-            return 1;
+            Matrix sequential_C(
+                static_cast<size_t>(n) * n, 0);
+
+            auto start = chrono::steady_clock::now();
+
+            multiply_sequential(A, B, sequential_C, n);
+
+            auto finish = chrono::steady_clock::now();
+
+            sequential_time =
+                chrono::duration<double, milli>(
+                    finish - start)
+                    .count();
         }
     }
 
-    if (thread_count <= 0)
+    MPI_Bcast(&valid, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (!valid)
     {
-        cerr << "Thread count must be positive\n";
+        MPI_Finalize();
         return 1;
     }
 
-    ifstream inA("A.txt");
-    ifstream inB("B.txt");
+    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    if (!inA || !inB)
+    if (rank != 0)
     {
-        cerr << "Cannot open input files\n";
-        return 1;
+        B.resize(static_cast<size_t>(n) * n);
     }
 
-    int nA, nB;
+    int matrix_count = n * n;
 
-    if (!(inA >> nA) || !(inB >> nB) || nA <= 0 || nA != nB)
+    MPI_Bcast(
+        B.data(),
+        matrix_count,
+        MPI_LONG_LONG_INT,
+        0,
+        MPI_COMM_WORLD);
+
+    vector<int> send_counts(process_count);
+    vector<int> send_displacements(process_count);
+
+    vector<int> receive_counts(process_count);
+    vector<int> receive_displacements(process_count);
+
+    int base_rows = n / process_count;
+    int remaining_rows = n % process_count;
+
+    int current_displacement = 0;
+
+    for (int i = 0; i < process_count; i++)
     {
-        cerr << "Invalid matrix sizes\n";
-        return 1;
+        int rows = base_rows +
+                   (i < remaining_rows ? 1 : 0);
+
+        send_counts[i] = rows * n;
+        send_displacements[i] = current_displacement;
+
+        receive_counts[i] = rows * n;
+        receive_displacements[i] = current_displacement;
+
+        current_displacement += rows * n;
     }
 
-    int n = nA;
-    thread_count = min(thread_count, n);
+    int local_rows = base_rows +
+                     (rank < remaining_rows ? 1 : 0);
 
-    Matrix A(n, vector<int>(n));
-    Matrix B(n, vector<int>(n));
+    Matrix local_A(
+        static_cast<size_t>(local_rows) * n);
 
-    for (int i = 0; i < n; i++)
+    Matrix local_C(
+        static_cast<size_t>(local_rows) * n, 0);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    double start_time = MPI_Wtime();
+
+    MPI_Scatterv(
+        rank == 0 ? A.data() : nullptr,
+        send_counts.data(),
+        send_displacements.data(),
+        MPI_LONG_LONG_INT,
+        local_A.data(),
+        local_rows * n,
+        MPI_LONG_LONG_INT,
+        0,
+        MPI_COMM_WORLD);
+
+    for (int i = 0; i < local_rows; i++)
     {
-        for (int j = 0; j < n; j++)
+        for (int k = 0; k < n; k++)
         {
-            if (!(inA >> A[i][j]) || !(inB >> B[i][j]))
+            for (int j = 0; j < n; j++)
             {
-                cerr << "Cannot read matrix elements\n";
-                return 1;
+                local_C[static_cast<size_t>(i) * n + j] +=
+                    local_A[static_cast<size_t>(i) * n + k] *
+                    B[static_cast<size_t>(k) * n + j];
             }
         }
     }
 
-    auto start = chrono::steady_clock::now();
+    MPI_Gatherv(
+        local_C.data(),
+        local_rows * n,
+        MPI_LONG_LONG_INT,
+        rank == 0 ? C.data() : nullptr,
+        receive_counts.data(),
+        receive_displacements.data(),
+        MPI_LONG_LONG_INT,
+        0,
+        MPI_COMM_WORLD);
 
-    ResultMatrix C = multiply(A, B, n);
+    double local_time = MPI_Wtime() - start_time;
+    double parallel_time = 0.0;
 
-    auto finish = chrono::steady_clock::now();
+    MPI_Reduce(
+        &local_time,
+        &parallel_time,
+        1,
+        MPI_DOUBLE,
+        MPI_MAX,
+        0,
+        MPI_COMM_WORLD);
 
-    double sequential_time =
-        chrono::duration<double, milli>(finish - start).count();
-
-    start = chrono::steady_clock::now();
-
-    ResultMatrix parallel_C =
-        multiply_parallel(A, B, n, thread_count);
-
-    finish = chrono::steady_clock::now();
-
-    double parallel_time =
-        chrono::duration<double, milli>(finish - start).count();
-
-    if (C != parallel_C)
+    if (rank == 0)
     {
-        cerr << "Error: results do not match\n";
-        return 1;
-    }
+        ofstream out("C.txt");
 
-    ofstream out("C.txt");
-
-    if (!out)
-    {
-        cerr << "Cannot create output file\n";
-        return 1;
-    }
-
-    out << n << '\n';
-
-    for (int i = 0; i < n; i++)
-    {
-        for (int j = 0; j < n; j++)
+        if (!out)
         {
-            out << parallel_C[i][j] << ' ';
+            cerr << "Cannot create output file\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        out << '\n';
+        out << n << '\n';
+
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                out << C[static_cast<size_t>(i) * n + j] << ' ';
+            }
+
+            out << '\n';
+        }
+
+        cout << "Matrix size: " << n << "x" << n << '\n';
+        cout << "MPI processes: " << process_count << '\n';
+
+        cout << fixed << setprecision(3);
+
+        cout << "Sequential time: "
+             << sequential_time << " ms\n";
+
+        cout << "Parallel time: "
+             << parallel_time * 1000.0 << " ms\n";
+
+        cout << "Results saved to C.txt\n";
+
+        if (parallel_time > 0.0)
+        {
+            cout << "Speedup: "
+                 << sequential_time / (parallel_time * 1000.0)
+                 << "x\n";
+        }
     }
 
-    cout << "Matrix size: " << n << "x" << n << '\n';
-    cout << "Thread count: " << thread_count << '\n';
-
-    cout << fixed << setprecision(3);
-
-    cout << "Sequential time: "
-         << sequential_time << " ms\n";
-
-    cout << "Parallel time: "
-         << parallel_time << " ms\n";
-
-    cout << "Results match: yes\n";
-
-    if (parallel_time > 0.0)
-    {
-        cout << "Speedup: "
-             << sequential_time / parallel_time << "x\n";
-    }
+    MPI_Finalize();
 
     return 0;
 }
